@@ -1,57 +1,66 @@
 package com.github.greengerong;
 
 
-import com.google.common.base.Predicate;
-import com.google.common.collect.Lists;
+import com.github.greengerong.config.SeoFilterConfig;
 import org.apache.commons.httpclient.HttpClient;
 import org.apache.commons.httpclient.HttpMethod;
+import org.apache.commons.httpclient.HttpStatus;
 import org.apache.commons.httpclient.methods.GetMethod;
 import org.apache.commons.lang.StringUtils;
+import org.apache.log4j.Logger;
 
 import javax.servlet.*;
 import javax.servlet.http.HttpServletRequest;
 import java.io.IOException;
 import java.io.PrintWriter;
-import java.net.URISyntaxException;
-import java.util.Arrays;
 import java.util.List;
-import java.util.regex.Pattern;
-
-import static com.google.common.collect.FluentIterable.from;
 
 public class PreRenderSEOFilter implements Filter {
+    public static final String REFERER_HEADER = "Referer";
+    private static final String FORWARD_SLASH = "/";
 
-    private FilterConfig filterConfig;
+    public static Logger LOG = Logger.getLogger(PreRenderSEOFilter.class);
+
+    private SeoFilterConfig config;
 
     @Override
     public void init(FilterConfig filterConfig) throws ServletException {
-        this.filterConfig = filterConfig;
+        config = new SeoFilterConfig(filterConfig);
+        LOG.info("Initialization Complete");
     }
 
     @Override
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse, FilterChain filterChain)
             throws IOException, ServletException {
-        try {
-            final HttpServletRequest request = (HttpServletRequest) servletRequest;
-            if (shouldShowPrerenderedPage(request)) {
+
+        final HttpServletRequest request = (HttpServletRequest) servletRequest;
+        if (shouldShowPrerenderedPage(request)) {
+            try {
                 final ResponseResult result = getPrerenderedPageResponse(request);
-                if (result.getStatusCode() == 200) {
+                if (result.getStatusCode() == HttpStatus.SC_OK) {
                     final PrintWriter writer = servletResponse.getWriter();
                     writer.write(result.getResponseBody());
                     writer.flush();
-                    return;
                 }
+            } catch (Exception e) {
+                LOG.warn("An error occured processing the request", e);
             }
-        } catch (Exception e) {
+        }else {
+            filterChain.doFilter(servletRequest, servletResponse);
         }
-        filterChain.doFilter(servletRequest, servletResponse);
+    }
+
+    @Override
+    public void destroy() {
+        config = null;
+        LOG.info("Shutting down");
     }
 
     private ResponseResult getPrerenderedPageResponse(HttpServletRequest request) throws IOException {
-        final String apiUrl = getApiUrl(getFullUrl(request));
+        final String apiUrl = getApiUrl(request, config);
         final HttpClient httpClient = new HttpClient();
         final GetMethod getMethod = new GetMethod(apiUrl);
-        setConfig(httpClient);
+        setProxy(httpClient);
         setHttpHeader(getMethod);
         final int code = httpClient.executeMethod(getMethod);
         final String responseBody = getMethod.getResponseBodyAsString();
@@ -59,7 +68,15 @@ public class PreRenderSEOFilter implements Filter {
         return new ResponseResult(code, body);
     }
 
-    private String getFullUrl(HttpServletRequest request) {
+    public static String getApiUrl(HttpServletRequest request, SeoFilterConfig config) {
+        String prerenderServiceUrl = config.getPrerenderServiceUrl();
+        if (!prerenderServiceUrl.endsWith(FORWARD_SLASH)) {
+            prerenderServiceUrl += FORWARD_SLASH;
+        }
+        return prerenderServiceUrl + getFullUrl(request);
+    }
+
+    private static String getFullUrl(HttpServletRequest request) {
         final StringBuffer url = request.getRequestURL();
         final String queryString = request.getQueryString();
         if (queryString != null) {
@@ -74,164 +91,37 @@ public class PreRenderSEOFilter implements Filter {
         httpMethod.setRequestHeader("Content-Type", "text/html");
     }
 
-    private void setConfig(HttpClient httpClient) {
-        final String proxy = filterConfig.getInitParameter("proxy");
-        if (StringUtils.isNotBlank(proxy)) {
-            final int proxyPort = Integer.parseInt(filterConfig.getInitParameter("proxyPort"));
-            httpClient.getHostConfiguration().setProxy(proxy, proxyPort);
+    private void setProxy(HttpClient httpClient) {
+        if (StringUtils.isNotBlank(config.getProxy())) {
+            httpClient.getHostConfiguration().setProxy(config.getProxy(), config.getProxyPort());
         }
     }
 
-    @Override
-    public void destroy() {
-        filterConfig = null;
-    }
-
-    private List<String> getCrawlerUserAgents() {
-        List<String> crawlerUserAgents = Lists.newArrayList("googlebot", "yahoo", "bingbot", "baiduspider",
-                "facebookexternalhit", "twitterbot");
-        final String crawlerUserAgentsFromConfig = filterConfig.getInitParameter("crawlerUserAgents");
-        if (StringUtils.isNotBlank(crawlerUserAgentsFromConfig)) {
-            crawlerUserAgents.addAll(Arrays.asList(crawlerUserAgentsFromConfig.trim().split(",")));
-        }
-
-        return crawlerUserAgents;
-    }
-
-    private List<String> getExtensionsToIgnore() {
-        List<String> extensionsToIgnore = Lists.newArrayList(".js", ".css", ".less", ".png", ".jpg", ".jpeg",
-                ".gif", ".pdf", ".doc", ".txt", ".zip", ".mp3", ".rar", ".exe", ".wmv", ".doc", ".avi", ".ppt", ".mpg",
-                ".mpeg", ".tif", ".wav", ".mov", ".psd", ".ai", ".xls", ".mp4", ".m4a", ".swf", ".dat", ".dmg",
-                ".iso", ".flv", ".m4v", ".torrent");
-        final String extensionsToIgnoreFromConfig = filterConfig.getInitParameter("extensionsToIgnore");
-        if (StringUtils.isNotBlank(extensionsToIgnoreFromConfig)) {
-            extensionsToIgnore.addAll(Arrays.asList(extensionsToIgnoreFromConfig.trim().split(",")));
-        }
-
-        return extensionsToIgnore;
-    }
-
-    private List<String> getWhitelist() {
-        final String whitelist = filterConfig.getInitParameter("whitelist");
-        if (StringUtils.isNotBlank(whitelist)) {
-            return Arrays.asList(whitelist.trim().split(","));
-        }
-        return null;
-    }
-
-    private List<String> getBlacklist() {
-        final String blacklist = filterConfig.getInitParameter("blacklist");
-        if (StringUtils.isNotBlank(blacklist)) {
-            return Arrays.asList(blacklist.trim().split(","));
-        }
-        return null;
-    }
-
-    private boolean shouldShowPrerenderedPage(HttpServletRequest request) throws URISyntaxException {
-        final String useAgent = request.getHeader("User-Agent");
-        final String url = request.getRequestURL().toString();
-        final String referer = request.getHeader("Referer");
-
-        if (hasEscapedFragment(request)) {
+    private boolean shouldShowPrerenderedPage(HttpServletRequest request){
+        if (RenderUtils.hasEscapedFragment(request)) {
             return true;
         }
 
-        if (StringUtils.isBlank(useAgent)) {
+        if (!RenderUtils.isValidUserAgent(request, config)) {
             return false;
         }
 
-        if (!isInSearchUserAgent(useAgent)) {
+        final String url = request.getRequestURI();
+
+        if (RenderUtils.ignoreFileExtension(url, config)) {
             return false;
         }
 
-
-        if (isInResources(url)) {
+        final List<String> whiteList = config.getWhitelist();
+        if (!whiteList.isEmpty() && !RenderUtils.isInWhiteList(url, whiteList)) {
             return false;
         }
 
-        final List<String> whiteList = getWhitelist();
-        if (whiteList != null && !isInWhiteList(url, whiteList)) {
-            return false;
-        }
-
-        final List<String> blacklist = getBlacklist();
-        if (blacklist != null && isInBlackList(url, referer, blacklist)) {
+        final List<String> blacklist = config.getBlacklist();
+        if (!blacklist.isEmpty() && RenderUtils.isInBlackList(url, request.getHeader(REFERER_HEADER), blacklist)) {
             return false;
         }
 
         return true;
-    }
-
-    private boolean hasEscapedFragment(HttpServletRequest request) {
-        return request.getParameterMap().containsKey("_escaped_fragment_");
-    }
-
-    private String getApiUrl(String url) {
-        String prerenderServiceUrl = getPrerenderServiceUrl();
-        if (!prerenderServiceUrl.endsWith("/")) {
-            prerenderServiceUrl += "/";
-        }
-        return prerenderServiceUrl + url;
-    }
-
-    private String getPrerenderServiceUrl() {
-        final String prerenderServiceUrl = filterConfig.getInitParameter("prerenderServiceUrl");
-        return StringUtils.isNotBlank(prerenderServiceUrl) ? prerenderServiceUrl : "http://prerender.herokuapp.com/";
-    }
-
-    private boolean isInBlackList(final String url, final String referer, List<String> blacklist) {
-        return from(blacklist).anyMatch(new Predicate<String>() {
-            @Override
-            public boolean apply(String regex) {
-                final Pattern pattern = Pattern.compile(regex);
-                return pattern.matcher(url).matches() ||
-                        (!StringUtils.isBlank(referer) && pattern.matcher(referer).matches());
-            }
-        });
-    }
-
-    private boolean isInWhiteList(final String url, List<String> whitelist) {
-        return from(whitelist).anyMatch(new Predicate<String>() {
-            @Override
-            public boolean apply(String regex) {
-                return Pattern.compile(regex).matcher(url).matches();
-            }
-        });
-    }
-
-    private boolean isInResources(final String url) {
-        return from(getExtensionsToIgnore()).anyMatch(new Predicate<String>() {
-            @Override
-            public boolean apply(String item) {
-                return url.contains(item.toLowerCase());
-            }
-        });
-    }
-
-    private boolean isInSearchUserAgent(final String useAgent) {
-        return from(getCrawlerUserAgents()).anyMatch(new Predicate<String>() {
-            @Override
-            public boolean apply(String item) {
-                return item.equalsIgnoreCase(useAgent);
-            }
-        });
-    }
-
-    private class ResponseResult {
-        private int statusCode;
-        private String responseBody;
-
-        public ResponseResult(int code, String body) {
-            statusCode = code;
-            responseBody = body;
-        }
-
-        private int getStatusCode() {
-            return statusCode;
-        }
-
-        private String getResponseBody() {
-            return responseBody;
-        }
     }
 }
